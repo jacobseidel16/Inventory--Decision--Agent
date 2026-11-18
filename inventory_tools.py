@@ -446,24 +446,7 @@ def calculate_quantity_discount(
         min_q = tier["min_qty"]
         effective_min_q = max(min_q, 1.0)
         max_q = tier["max_qty"]
-
-        if raw_eoq < effective_min_q:
-            feasible_qty = effective_min_q
-            eoq_in_range = False
-            adjustment = "adjusted_up_to_min_qty"
-        elif max_q is not None and raw_eoq > max_q:
-            feasible_qty = max_q
-            eoq_in_range = False
-            adjustment = "clamped_down_to_max_qty"
-        else:
-            feasible_qty = raw_eoq
-            eoq_in_range = True
-            adjustment = "none"
-
-        purchasing_cost = D * C_i
-        ordering_cost_annual = (D / feasible_qty) * S
-        holding_cost_annual = (feasible_qty / 2.0) * H_i
-        total_annual_cost = purchasing_cost + ordering_cost_annual + holding_cost_annual
+        next_min_q = normalized_tiers[idx]["min_qty"] if idx < len(normalized_tiers) else None
 
         max_str = _fmt_num(max_q) if max_q is not None else "infinity"
         if h_rate is not None:
@@ -471,16 +454,57 @@ def calculate_quantity_discount(
         else:
             h_expr = f"H_{idx} = {_fmt_money(H_i)} (fixed)"
 
-        substituted.append(
-            f"Tier {idx} (Qty {_fmt_num(min_q)}-{max_str}, C_{idx} = {_fmt_money(C_i)}): "
-            f"{h_expr}; Q_{idx} = sqrt((2 * {_fmt_num(D)} * {_fmt_money(S)}) / {_fmt_money(H_i)}) = {raw_eoq:,.4f} "
-            f"-> Feasible Q_{idx}* = {feasible_qty:,.4f} ({adjustment})"
+        above_upper = (max_q is not None and raw_eoq > max_q + 1e-9) or (
+            next_min_q is not None and raw_eoq >= next_min_q - 1e-9
         )
-        substituted.append(
-            f"Tier {idx} TC_{idx} = ({_fmt_num(D)} * {_fmt_money(C_i)}) + ({_fmt_num(D)} / {feasible_qty:,.4f}) * {_fmt_money(S)} "
-            f"+ ({feasible_qty:,.4f} / 2) * {_fmt_money(H_i)} = ${purchasing_cost:,.2f} + ${ordering_cost_annual:,.2f} "
-            f"+ ${holding_cost_annual:,.2f} = ${total_annual_cost:,.2f}"
-        )
+
+        if raw_eoq < effective_min_q - 1e-9:
+            # EOQ is below this tier's minimum qualifying quantity -> evaluate min_qty
+            feasible_qty: Optional[float] = effective_min_q
+            eoq_in_range = False
+            is_feasible_candidate = True
+            adjustment = "adjusted_up_to_min_qty"
+        elif above_upper:
+            # Standard all-units model: EOQ exceeds this tier's upper bound (qualifies for a higher tier)
+            feasible_qty = None
+            eoq_in_range = False
+            is_feasible_candidate = False
+            adjustment = "infeasible_above_max_qty"
+        else:
+            feasible_qty = raw_eoq
+            eoq_in_range = True
+            is_feasible_candidate = True
+            adjustment = "none"
+
+        if is_feasible_candidate and feasible_qty is not None:
+            purchasing_cost: Optional[float] = D * C_i
+            ordering_cost_annual: Optional[float] = (D / feasible_qty) * S
+            holding_cost_annual: Optional[float] = (feasible_qty / 2.0) * H_i
+            total_annual_cost: Optional[float] = purchasing_cost + ordering_cost_annual + holding_cost_annual
+            orders_yr: Optional[float] = D / feasible_qty
+
+            substituted.append(
+                f"Tier {idx} (Qty {_fmt_num(min_q)}-{max_str}, C_{idx} = {_fmt_money(C_i)}): "
+                f"{h_expr}; Q_{idx} = sqrt((2 * {_fmt_num(D)} * {_fmt_money(S)}) / {_fmt_money(H_i)}) = {raw_eoq:,.4f} "
+                f"-> Feasible Candidate Q_{idx}* = {feasible_qty:,.4f} ({adjustment})"
+            )
+            substituted.append(
+                f"Tier {idx} TC_{idx} = ({_fmt_num(D)} * {_fmt_money(C_i)}) + ({_fmt_num(D)} / {feasible_qty:,.4f}) * {_fmt_money(S)} "
+                f"+ ({feasible_qty:,.4f} / 2) * {_fmt_money(H_i)} = ${purchasing_cost:,.2f} + ${ordering_cost_annual:,.2f} "
+                f"+ ${holding_cost_annual:,.2f} = ${total_annual_cost:,.2f}"
+            )
+        else:
+            purchasing_cost = None
+            ordering_cost_annual = None
+            holding_cost_annual = None
+            total_annual_cost = None
+            orders_yr = None
+
+            substituted.append(
+                f"Tier {idx} (Qty {_fmt_num(min_q)}-{max_str}, C_{idx} = {_fmt_money(C_i)}): "
+                f"{h_expr}; Q_{idx} = sqrt((2 * {_fmt_num(D)} * {_fmt_money(S)}) / {_fmt_money(H_i)}) = {raw_eoq:,.4f} "
+                f"-> Infeasible for Tier {idx} (EOQ exceeds upper limit {max_str}; qualifies for a higher-quantity tier)"
+            )
 
         evaluated_tiers.append(
             {
@@ -492,8 +516,9 @@ def calculate_quantity_discount(
                 "raw_eoq": raw_eoq,
                 "feasible_order_qty": feasible_qty,
                 "eoq_in_range": eoq_in_range,
+                "is_feasible_candidate": is_feasible_candidate,
                 "adjustment": adjustment,
-                "orders_per_year": D / feasible_qty,
+                "orders_per_year": orders_yr,
                 "annual_purchasing_cost": purchasing_cost,
                 "annual_ordering_cost": ordering_cost_annual,
                 "annual_holding_cost": holding_cost_annual,
@@ -501,17 +526,41 @@ def calculate_quantity_discount(
             }
         )
 
-    best_tier = min(evaluated_tiers, key=lambda t: t["total_annual_cost"])
-    base_tier = evaluated_tiers[0]
-    savings_vs_base = base_tier["total_annual_cost"] - best_tier["total_annual_cost"]
+    feasible_candidates = [t for t in evaluated_tiers if t["is_feasible_candidate"]]
+    if not feasible_candidates:
+        # Defensive fallback only if every tier was bounded below its EOQ
+        last_tier = evaluated_tiers[-1]
+        fallback_q = last_tier["max_qty"] or max(last_tier["min_qty"], 1.0)
+        C_last = last_tier["unit_cost"]
+        H_last = last_tier["holding_cost_per_unit"]
+        p_cost = D * C_last
+        o_cost = (D / fallback_q) * S
+        h_cost = (fallback_q / 2.0) * H_last
+        last_tier.update(
+            {
+                "feasible_order_qty": fallback_q,
+                "is_feasible_candidate": True,
+                "adjustment": "clamped_down_to_max_qty",
+                "orders_per_year": D / fallback_q,
+                "annual_purchasing_cost": p_cost,
+                "annual_ordering_cost": o_cost,
+                "annual_holding_cost": h_cost,
+                "total_annual_cost": p_cost + o_cost + h_cost,
+            }
+        )
+        feasible_candidates = [last_tier]
+
+    best_tier = min(feasible_candidates, key=lambda t: t["total_annual_cost"])
+    base_feasible_tier = feasible_candidates[0]
+    savings_vs_base = base_feasible_tier["total_annual_cost"] - best_tier["total_annual_cost"]
 
     tier_costs_str = ", ".join(
-        f"TC_{t['tier']}=${t['total_annual_cost']:,.2f}" for t in evaluated_tiers
+        f"TC_{t['tier']}=${t['total_annual_cost']:,.2f}" for t in feasible_candidates
     )
     substituted.append(
         f"Optimal Selection = min({tier_costs_str}) "
         f"-> Tier {best_tier['tier']} with Q* = {best_tier['feasible_order_qty']:,.4f} units "
-        f"and TC* = ${best_tier['total_annual_cost']:,.2f}"
+        f"at {_fmt_money(best_tier['unit_cost'])}/unit and TC* = ${best_tier['total_annual_cost']:,.2f}"
     )
 
     inputs_extracted: Dict[str, Any] = {
@@ -541,15 +590,22 @@ def calculate_quantity_discount(
     formulas = [
         "H_i = h * C_i" if h_rate is not None else "H_i = H (fixed across all tiers)",
         "Q_i = sqrt((2 * D * S) / H_i)",
-        "Q_i* = Q_i if min_qty_i <= Q_i <= max_qty_i; otherwise adjust to nearest feasible boundary",
+        "Feasibility check: if min_qty_i <= Q_i <= max_qty_i, Q_i* = Q_i; if Q_i < min_qty_i, Q_i* = min_qty_i; if Q_i > max_qty_i, tier EOQ is infeasible",
         "TC_i = (D * C_i) + (D / Q_i*) * S + (Q_i* / 2) * H_i",
-        "Optimal Policy = argmin_i TC_i",
+        "Optimal Policy = argmin_i TC_i across all feasible candidates",
     ]
 
     # Verification Checks
     q_opt = best_tier["feasible_order_qty"]
-    in_bounds = q_opt >= max(best_tier["min_qty"], 1.0) - 1e-9 and (
-        best_tier["max_qty"] is None or q_opt <= best_tier["max_qty"] + 1e-9
+    best_next_min = (
+        normalized_tiers[best_tier["tier"]]["min_qty"]
+        if best_tier["tier"] < len(normalized_tiers)
+        else None
+    )
+    in_bounds = (
+        q_opt >= max(best_tier["min_qty"], 1.0) - 1e-9
+        and (best_tier["max_qty"] is None or q_opt <= best_tier["max_qty"] + 1e-9)
+        and (best_next_min is None or q_opt < best_next_min - 1e-9)
     )
     all_decomp_ok = all(
         abs(
@@ -557,9 +613,9 @@ def calculate_quantity_discount(
             - t["total_annual_cost"]
         )
         < 1e-6
-        for t in evaluated_tiers
+        for t in feasible_candidates
     )
-    min_total = min(t["total_annual_cost"] for t in evaluated_tiers)
+    min_total = min(t["total_annual_cost"] for t in feasible_candidates)
     verification_checks = [
         _make_check(
             "Selected Quantity Within Tier Bounds",
@@ -568,12 +624,12 @@ def calculate_quantity_discount(
             f"{_fmt_num(best_tier['max_qty']) if best_tier['max_qty'] is not None else 'infinity'}], Q* = {q_opt:,.4f}.",
         ),
         _make_check(
-            "Cost Decomposition Identity Across All Tiers",
+            "Cost Decomposition Identity Across All Feasible Candidates",
             all_decomp_ok,
-            f"Purchasing + Ordering + Holding equals Total Annual Cost for all {len(evaluated_tiers)} evaluated tiers.",
+            f"Purchasing + Ordering + Holding equals Total Annual Cost for all {len(feasible_candidates)} feasible candidate(s).",
         ),
         _make_check(
-            "Global Minimum Across All Tiers",
+            "Global Minimum Across All Feasible Candidates",
             abs(best_tier["total_annual_cost"] - min_total) < 1e-6,
             f"Selected Tier {best_tier['tier']} cost (${best_tier['total_annual_cost']:,.2f}) equals global minimum (${min_total:,.2f}).",
         ),
