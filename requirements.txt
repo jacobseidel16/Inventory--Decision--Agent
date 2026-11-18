@@ -1,0 +1,7 @@
+streamlit>=1.32.0
+pandas>=2.0.0
+pytest>=8.0.0
+
+# Optional: install openai if you want to enable optional LLM-assisted
+# extraction/explanation when OPENAI_API_KEY is set.
+# openai>=1.0.0
