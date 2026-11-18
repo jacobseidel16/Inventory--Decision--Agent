@@ -244,9 +244,9 @@ def _extract_price_breaks(text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     tiers: List[Dict[str, Any]] = []
     assumptions: List[str] = []
 
-    # 1. Range before price: "1-499 units at $20", "500 to 999: $18.50"
+    # 1. Range before price: "1-499 units at $20", "500–999 units: $11.50", "500 to 999: $18.50"
     range_before_price = re.finditer(
-        rf"\b({_NUM_PAT})\s*(?:-|–|to)\s*({_NUM_PAT})\s*(?:units?|items?|pcs?|pieces?)?\s*"
+        rf"\b({_NUM_PAT})\s*(?:-|–|—|to)\s*({_NUM_PAT})\s*(?:units?|items?|pcs?|pieces?)?\s*"
         rf"(?:at|for|costs?|cost|price(?:d)?\s*(?:at)?|unit\s+price\s*(?:is|of)?|is|are|:|=)?\s*\$\s*({_NUM_PAT})",
         text,
         flags=re.IGNORECASE,
@@ -263,7 +263,7 @@ def _extract_price_breaks(text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     # 2. Price before range: "$20 for 1-499 units", "$18 for orders of 500 to 999"
     price_before_range = re.finditer(
         rf"\$\s*({_NUM_PAT})\s*(?:per\s+unit|each|/unit)?\s*(?:for|if\s+ordering|on|when\s+ordering)\s+"
-        rf"(?:orders?\s+of\s+)?({_NUM_PAT})\s*(?:-|–|to)\s*({_NUM_PAT})\s*(?:units?|items?)?",
+        rf"(?:orders?\s+of\s+)?({_NUM_PAT})\s*(?:-|–|—|to)\s*({_NUM_PAT})\s*(?:units?|items?)?",
         text,
         flags=re.IGNORECASE,
     )
@@ -276,9 +276,9 @@ def _extract_price_breaks(text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
             }
         )
 
-    # 3. Open lower bound: "under 500 at $20", "fewer than 500 units: $20", "up to 499 at $20"
+    # 3. Open lower bound: "under 500 at $20", "Orders below 500 units: $12.00", "up to 499 at $20"
     open_low_before_price = re.finditer(
-        rf"(?:(under|less\s+than|fewer\s+than|below|<)|(up\s+to|<=|≤))\s*({_NUM_PAT})\s*(?:units?|items?)?\s*"
+        rf"(?:(under|less\s+than|fewer\s+than|below|<)|(up\s+to|<=|≤))\s*({_NUM_PAT})\s*(?:units?|items?|pcs?|pieces?)?\s*"
         rf"(?:at|for|costs?|price(?:d)?\s*(?:at)?|is|:|=)?\s*\$\s*({_NUM_PAT})",
         text,
         flags=re.IGNORECASE,
@@ -299,10 +299,11 @@ def _extract_price_breaks(text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
         max_q = max(1.0, upper - 1.0) if m.group(2) else upper
         tiers.append({"min_qty": 1.0, "max_qty": max_q, "unit_cost": _parse_number(m.group(1))})
 
-    # 4. Open upper bound: "1,000+ at $16", "1000 or more units for $16", ">= 1000: $16"
+    # 4. Open upper bound:
+    #    "1,000+ at $16", "1,000 or more units: $11.00", "1,000 units or more: $11.00", ">= 1,000: $16"
     open_high_before_price = re.finditer(
-        rf"(?:(?:at\s+least|>=|≥|over|more\s+than)\s*({_NUM_PAT})|({_NUM_PAT})\s*(?:\+|or\s+more|and\s+up|and\s+above))\s*"
-        rf"(?:units?|items?)?\s*(?:at|for|costs?|price(?:d)?\s*(?:at)?|is|:|=)?\s*\$\s*({_NUM_PAT})",
+        rf"(?:(?:at\s+least|>=|≥|over|more\s+than)\s*({_NUM_PAT})|({_NUM_PAT})\s*(?:(?:units?|items?|pcs?|pieces?)\s+)?(?:\+|or\s+more|and\s+up|and\s+above))\s*"
+        rf"(?:units?|items?|pcs?|pieces?)?\s*(?:at|for|costs?|price(?:d)?\s*(?:at)?|is|:|=)?\s*\$\s*({_NUM_PAT})",
         text,
         flags=re.IGNORECASE,
     )
@@ -312,7 +313,7 @@ def _extract_price_breaks(text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
 
     price_before_open_high = re.finditer(
         rf"\$\s*({_NUM_PAT})\s*(?:per\s+unit|each|/unit)?\s*(?:for|if\s+ordering|on|when\s+ordering)\s+"
-        rf"(?:orders?\s+of\s+)?(?:(?:at\s+least|>=|≥|over|more\s+than)\s*({_NUM_PAT})|({_NUM_PAT})\s*(?:\+|or\s+more|and\s+up))",
+        rf"(?:orders?\s+of\s+)?(?:(?:at\s+least|>=|≥|over|more\s+than)\s*({_NUM_PAT})|({_NUM_PAT})\s*(?:(?:units?|items?|pcs?|pieces?)\s+)?(?:\+|or\s+more|and\s+up|and\s+above))",
         text,
         flags=re.IGNORECASE,
     )
@@ -583,8 +584,8 @@ class InventoryDecisionAgent:
                 (r"\bvolume\s+discount|\bbulk\s+discount|\btiered\s+pricing", 5.5, "mentions volume/bulk discount"),
                 (r"\ball[\s-]units?\s+discount", 6.0, "mentions 'all-units discount'"),
                 (r"\bdiscount\b", 3.0, "mentions 'discount'"),
-                (r"\b\d+\s*(?:-|to)\s*\d+.*\$\d+", 4.5, "contains quantity-range pricing tiers"),
-                (r"\d+\s*(?:\+|or\s+more).*\$\d+", 3.5, "contains threshold pricing tier"),
+                (rf"\b{_NUM_PAT}\s*(?:-|–|—|to)\s*{_NUM_PAT}[^\n]*\$\s*\d+", 4.5, "contains quantity-range pricing tiers"),
+                (rf"{_NUM_PAT}\s*(?:(?:units?|items?)\s+)?(?:\+|or\s+more|and\s+up)[^\n]*\$\s*\d+", 3.5, "contains threshold pricing tier"),
             ],
             "newsvendor": [
                 (r"\bnewsvendor\b|\bnewsboy\b", 7.0, "mentions 'newsvendor'"),
@@ -635,7 +636,7 @@ class InventoryDecisionAgent:
 
         parsed_tiers, _ = _extract_price_breaks(question)
         if len(parsed_tiers) >= 2:
-            scores["quantity_discount"] += 6.0
+            scores["quantity_discount"] += 12.0
             signals["quantity_discount"].append(f"detected {len(parsed_tiers)} price-break tiers")
 
         if scores["fixed_period_review"] >= 5.0:
@@ -1618,18 +1619,30 @@ class InventoryDecisionAgent:
         if model_id == "quantity_discount" and "tier_evaluations" in inter:
             lines.append(f"- **Holding Cost Mode:** `{inter['holding_cost_mode']}`")
             lines.append("")
-            lines.append("| Tier | Qty Range | Unit Price | H_i | Raw EOQ | Feasible Order Qty | Purchasing | Ordering | Holding | Total Annual Cost |")
-            lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+            lines.append("| Tier | Qty Range | Unit Price | H_i | Raw EOQ | Status / Feasible Qty | Annual Purchase | Annual Ordering | Annual Holding | Total Annual Cost |")
+            lines.append("|---:|---|---:|---:|---:|---|---:|---:|---:|---:|")
             opt_tier = final["optimal_tier"]
             for t in inter["tier_evaluations"]:
                 hi = f"{t['max_qty']:,.0f}" if t["max_qty"] is not None else "∞"
                 mark = " *(Optimal)*" if t["tier"] == opt_tier else ""
-                lines.append(
-                    f"| {t['tier']}{mark} | {t['min_qty']:,.0f}–{hi} | ${t['unit_cost']:,.2f} | "
-                    f"${t['holding_cost_per_unit']:,.4f} | {t['raw_eoq']:,.4f} | {t['feasible_order_qty']:,.4f} | "
-                    f"${t['annual_purchasing_cost']:,.2f} | ${t['annual_ordering_cost']:,.2f} | "
-                    f"${t['annual_holding_cost']:,.2f} | ${t['total_annual_cost']:,.2f} |"
-                )
+                if t.get("is_feasible_candidate") and t["feasible_order_qty"] is not None:
+                    q_label = (
+                        f"{t['feasible_order_qty']:,.2f} (EOQ feasible)"
+                        if t["eoq_in_range"]
+                        else f"{t['feasible_order_qty']:,.2f} (adjusted to min qty)"
+                    )
+                    lines.append(
+                        f"| {t['tier']}{mark} | {t['min_qty']:,.0f}–{hi} | ${t['unit_cost']:,.2f} | "
+                        f"${t['holding_cost_per_unit']:,.2f} | {t['raw_eoq']:,.2f} | {q_label} | "
+                        f"${t['annual_purchasing_cost']:,.2f} | ${t['annual_ordering_cost']:,.2f} | "
+                        f"${t['annual_holding_cost']:,.2f} | ${t['total_annual_cost']:,.2f} |"
+                    )
+                else:
+                    lines.append(
+                        f"| {t['tier']} | {t['min_qty']:,.0f}–{hi} | ${t['unit_cost']:,.2f} | "
+                        f"${t['holding_cost_per_unit']:,.2f} | {t['raw_eoq']:,.2f} | Infeasible (EOQ > max) | "
+                        f"— | — | — | — |"
+                    )
         elif model_id == "inventory_classification" and "class_summary" in inter:
             lines.append(f"- **Total Items:** {inter['total_items']:,}")
             lines.append(f"- **Total Sales ($):** ${inter['total_sales']:,.2f}")
@@ -1650,9 +1663,21 @@ class InventoryDecisionAgent:
 
         # 6. Final Answer
         lines.append("\n### 6. Final Answer")
-        for k, v in final.items():
-            if v is not None:
-                lines.append(f"- **`{k}`**: {self._format_value(v)}")
+        if model_id == "quantity_discount":
+            lines.append(f"- **Optimal Tier:** Tier {final['optimal_tier']}")
+            lines.append(f"- **Optimal Order Quantity:** {self._format_value(final['optimal_order_qty'])} units")
+            lines.append(f"- **Unit Price:** ${final['optimal_unit_cost']:,.2f}")
+            lines.append(f"- **Orders per Year:** {self._format_value(final['orders_per_year'])}")
+            lines.append(f"- **Annual Purchase Cost:** ${final['annual_purchasing_cost']:,.2f}")
+            lines.append(f"- **Annual Ordering Cost:** ${final['annual_ordering_cost']:,.2f}")
+            lines.append(f"- **Annual Holding Cost:** ${final['annual_holding_cost']:,.2f}")
+            lines.append(f"- **Total Annual Cost:** ${final['total_annual_cost']:,.2f}")
+            if final.get("annual_savings_vs_base_tier") is not None:
+                lines.append(f"- **Annual Savings vs. Highest-Price Feasible Tier:** ${final['annual_savings_vs_base_tier']:,.2f}")
+        else:
+            for k, v in final.items():
+                if v is not None:
+                    lines.append(f"- **`{k}`**: {self._format_value(v)}")
 
         # 7. Verification Checks
         passed_count = sum(1 for c in verification.checks if c.passed)
